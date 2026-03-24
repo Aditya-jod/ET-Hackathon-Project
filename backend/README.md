@@ -177,13 +177,6 @@ rm -rf backend/knowledge/db
 3. Deploy to AWS Lambda, Google Cloud Run, or Docker
 4. Ensure API keys are in secure environment variables (not .env file)
 
-## Next Steps
-
-- Build React frontend (WebSocket integration + forms)
-- Implement portfolio parsing (pdfplumber CAMS extraction)
-- Add couple's planning (joint income optimization)
-- Mobile app (React Native)
-
 ---
 
 **Built with ❤️ for the ET AI Hackathon 2026**
