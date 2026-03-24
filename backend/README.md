@@ -1,6 +1,6 @@
 # ArthAgent Backend — AI Financial Planning System
 
-Production-ready multi-agent financial planning system for the ET AI Hackathon 2026.
+Multi-agent financial planning system for the ET AI Hackathon 2026.
 
 ## Quick Start
 
