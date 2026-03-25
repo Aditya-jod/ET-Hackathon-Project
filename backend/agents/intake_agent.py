@@ -104,7 +104,7 @@ async def intake_agent(state: ArthAgentState) -> ArthAgentState:
                 profile = UserProfile(
                     session_id=state["session_id"],
                     age=extracted.get("age", 35),
-                    income__dict__(
+                    income=dict(
                         basic_salary=extracted.get("basic_salary", 1800000),
                         hra_received=extracted.get("hra_received", 360000),
                         other_income=extracted.get("other_income", 0),
