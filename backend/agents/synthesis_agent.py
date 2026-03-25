@@ -1,11 +1,21 @@
-"""Synthesis agent: Generate structured financial plan using Claude."""
+"""Synthesis agent: Generate structured financial plan using Claude or local Ollama."""
 
 from datetime import datetime
 import json
-from anthropic import Anthropic
+import os
 from ..agents.state import ArthAgentState
 
-client = Anthropic()
+# Try Anthropic first, fall back to Ollama if no API key
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+USE_OLLAMA = not ANTHROPIC_API_KEY or os.getenv("USE_OLLAMA", "false").lower() == "true"
+
+if USE_OLLAMA:
+    import requests
+    OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
+    client = None  # We'll use requests directly
+else:
+    from anthropic import Anthropic
+    client = Anthropic()
 
 SYNTHESIS_PROMPT = """You are an expert financial advisor synthesizing a comprehensive financial plan.
 
@@ -49,7 +59,7 @@ Return ONLY valid JSON."""
 
 
 async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
-    """SynthesisAgent node: Generate final plan using Claude."""
+    """SynthesisAgent node: Generate final plan using Claude or Ollama."""
     state["current_step"] = "synthesis_agent"
     state["audit_log"].append({
         "timestamp": datetime.utcnow().isoformat(),
@@ -63,7 +73,7 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
         scenarios = state.get("scenarios", {})
         flags = state.get("regulatory_flags", [])
 
-        # Prepare context for Claude
+        # Prepare context for LLM
         prompt = SYNTHESIS_PROMPT.format(
             profile=json.dumps(profile, indent=2, default=str),
             tax_analysis=json.dumps(calculations.get("tax_analysis", {}), indent=2, default=str),
@@ -72,20 +82,22 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
             flags=json.dumps(flags, indent=2, default=str),
         )
 
-        # Call Claude Sonnet
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
-        )
+        # Call LLM (Claude or Ollama)
+        if USE_OLLAMA:
+            response_text = await _call_ollama(prompt)
+        else:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=2000,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+            )
+            response_text = response.content[0].text.strip()
 
-        response_text = response.content[0].text.strip()
-        
         # Parse JSON from response (handle markdown wrapping)
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
@@ -99,12 +111,12 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
             "timestamp": datetime.utcnow().isoformat(),
             "step": "synthesis_agent",
             "status": "completed",
-            "detail": "Financial plan synthesized successfully",
+            "detail": f"Plan synthesized via {'Ollama' if USE_OLLAMA else 'Claude'}",
         })
 
     except Exception as e:
         state["error"] = f"Synthesis error: {str(e)}"
-        # Fallback to simple plan if Claude fails
+        # Fallback to simple plan if LLM fails
         state["final_plan"] = {
             "executive_summary": "Financial plan generated (synthesis pending)",
             "immediate_actions": ["Review tax optimization", "Set up SIP"],
@@ -125,3 +137,24 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
         })
 
     return state
+
+
+async def _call_ollama(prompt: str) -> str:
+    """Call local Ollama API for synthesis."""
+    import requests
+    
+    try:
+        response = requests.post(
+            f"{OLLAMA_API_URL}/api/generate",
+            json={
+                "model": "mistral",  # or "llama2", "neural-chat", etc.
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.0,
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json()["response"]
+    except Exception as e:
+        raise RuntimeError(f"Ollama API error: {str(e)}. Is Ollama running? Start with: ollama serve")
