@@ -1,5 +1,3 @@
-"""Scenario (what-if) analysis router."""
-
 from fastapi import APIRouter
 from ..models.scenario import ScenarioRequest
 
