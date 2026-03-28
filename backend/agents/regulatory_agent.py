@@ -49,7 +49,7 @@ async def regulatory_agent(state: ArthAgentState) -> ArthAgentState:
             flags.append({
                 "type": "missed_deduction",
                 "status": "warning",
-                "message": "No health insurance deduction claimed. Up to ₹50K available u/s 80D.",
+                "message": "No health insurance deduction claimed. Up to ₹25K available (self+family below 60) u/s 80D.",
             })
 
         # Check NPS compliance
