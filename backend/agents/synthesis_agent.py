@@ -1,21 +1,19 @@
-"""Synthesis agent: Generate structured financial plan using Claude or local Ollama."""
+"""Synthesis agent: Generate structured financial plan using Claude, Ollama, or Groq."""
 
+import asyncio
 from datetime import datetime
 import json
 import os
 from ..agents.state import ArthAgentState
 
-# Try Anthropic first, fall back to Ollama if no API key
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-USE_OLLAMA = not ANTHROPIC_API_KEY or os.getenv("USE_OLLAMA", "false").lower() == "true"
+import httpx
+from groq import Groq
 
-if USE_OLLAMA:
-    import requests
-    OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434")
-    client = None  # We'll use requests directly
-else:
-    from anthropic import Anthropic
-    client = Anthropic()
+OLLAMA_BASE_URL   = "http://localhost:11434"
+OLLAMA_MODEL      = "llama3.1:8b"
+OLLAMA_TIMEOUT    = 45.0   # seconds — covers cold start
+GROQ_MODEL        = "llama-3.1-8b-instant"
+MAX_RETRIES       = 2
 
 SYNTHESIS_PROMPT = """You are an expert financial advisor synthesizing a comprehensive financial plan.
 
@@ -58,8 +56,80 @@ Generate a JSON response with this structure:
 Return ONLY valid JSON."""
 
 
+async def _call_ollama_async(prompt: str) -> str:
+    """
+    Call Ollama with a hard timeout.
+    Raises asyncio.TimeoutError if Ollama doesn't respond in time.
+    """
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
+        response = await client.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+            },
+        )
+        response.raise_for_status()
+        return response.json()["response"]
+
+
+async def _call_groq(prompt: str) -> str:
+    """Groq free-tier fallback. Runs in thread pool (SDK is sync)."""
+    client = Groq()  # reads GROQ_API_KEY from env
+    loop   = asyncio.get_event_loop()
+
+    def _sync_call():
+        completion = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2048,
+            temperature=0.3,
+        )
+        return completion.choices[0].message.content
+
+    return await loop.run_in_executor(None, _sync_call)
+
+
+async def call_llm_with_fallback(prompt: str) -> tuple[str, str]:
+    """
+    Try Ollama first (local, zero cost).
+    If timeout or any error → fall back to Groq (free API).
+
+    Returns:
+        (response_text, provider_used)
+        provider_used is "ollama" or "groq" — log this in audit_trail.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            text = await asyncio.wait_for(
+                _call_ollama_async(prompt),
+                timeout=OLLAMA_TIMEOUT,
+            )
+            return text, "ollama"
+
+        except (asyncio.TimeoutError, httpx.ConnectError, httpx.HTTPError) as e:
+            # Ollama not running or too slow — fall through to Groq
+            error_type = type(e).__name__
+            # Log but don't crash — Groq is the fallback
+            print(f"[synthesis_agent] Ollama attempt {attempt+1} failed: {error_type}. "
+                  f"{'Retrying...' if attempt < MAX_RETRIES - 1 else 'Switching to Groq.'}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(1)
+
+    # All Ollama attempts failed — use Groq
+    try:
+        text = await _call_groq(prompt)
+        return text, "groq"
+    except Exception as e:
+        raise RuntimeError(
+            f"Both Ollama and Groq failed. Groq error: {e}. "
+            f"Check GROQ_API_KEY in .env and internet connectivity."
+        ) from e
+
+
 async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
-    """SynthesisAgent node: Generate final plan using Claude or Ollama."""
+    """SynthesisAgent node: Generate final plan using Ollama or Groq."""
     state["current_step"] = "synthesis_agent"
     state["audit_log"].append({
         "timestamp": datetime.utcnow().isoformat(),
@@ -74,7 +144,7 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
         flags = state.get("regulatory_flags", [])
 
         # Prepare context for LLM
-        prompt = SYNTHESIS_PROMPT.format(
+        synthesis_prompt = SYNTHESIS_PROMPT.format(
             profile=json.dumps(profile, indent=2, default=str),
             tax_analysis=json.dumps(calculations.get("tax_analysis", {}), indent=2, default=str),
             fire_plan=json.dumps(calculations.get("fire_plan", {}), indent=2, default=str),
@@ -82,23 +152,16 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
             flags=json.dumps(flags, indent=2, default=str),
         )
 
-        # Call LLM (Claude or Ollama)
-        if USE_OLLAMA:
-            response_text = await _call_ollama(prompt)
-        else:
-            response = client.messages.create(
-                model="claude-sonnet-4-20250514",
-                max_tokens=2000,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    }
-                ],
-            )
-            response_text = response.content[0].text.strip()
+        # Call LLM with proper fallback chain
+        llm_response, provider = await call_llm_with_fallback(synthesis_prompt)
+        state["audit_log"].append({
+            "agent": "synthesis_agent",
+            "llm_provider": provider,
+            "timestamp": datetime.utcnow().isoformat(),
+        })
 
         # Parse JSON from response (handle markdown wrapping)
+        response_text = llm_response.strip()
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
@@ -111,7 +174,7 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
             "timestamp": datetime.utcnow().isoformat(),
             "step": "synthesis_agent",
             "status": "completed",
-            "detail": f"Plan synthesized via {'Ollama' if USE_OLLAMA else 'Claude'}",
+            "detail": f"Plan synthesized via {provider}",
         })
 
     except Exception as e:
@@ -137,24 +200,3 @@ async def synthesis_agent(state: ArthAgentState) -> ArthAgentState:
         })
 
     return state
-
-
-async def _call_ollama(prompt: str) -> str:
-    """Call local Ollama API for synthesis."""
-    import requests
-    
-    try:
-        response = requests.post(
-            f"{OLLAMA_API_URL}/api/generate",
-            json={
-                "model": "mistral",  # or "llama2", "neural-chat", etc.
-                "prompt": prompt,
-                "stream": False,
-                "temperature": 0.0,
-            },
-            timeout=120,
-        )
-        response.raise_for_status()
-        return response.json()["response"]
-    except Exception as e:
-        raise RuntimeError(f"Ollama API error: {str(e)}. Is Ollama running? Start with: ollama serve")
